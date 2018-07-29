@@ -3,11 +3,23 @@
 #include <Processing.NDI.Lib.h>
 
 //######################################
+// Defines
+//######################################
+
+// Define ASYNC_MODE to activate asynchronous mode. In async mode sample data is sent asynchronously,
+// which unfortunately requires to copy it in memory, but performance is still better.
+
+#define ASYNC_MODE
+
+//######################################
 // Globals
 //######################################
-SIZE g_videoSize;
-NDIlib_FourCC_type_e g_videoFourCC;
 NDIlib_send_instance_t g_pNDI_send = NULL;
+NDIlib_video_frame_v2_t g_NDI_video_frame;
+
+#ifdef ASYNC_MODE
+PBYTE g_data = NULL;
+#endif
 
 //######################################
 // GUIDs
@@ -122,6 +134,13 @@ CVideoRenderer::~CVideoRenderer () {
 		NDIlib_destroy();
 	}
 
+#ifdef ASYNC_MODE
+	if (g_data) {
+		free(g_data);
+		g_data = NULL;
+	}
+#endif
+
 	m_pInputPin = NULL;
 }
 
@@ -190,23 +209,25 @@ CBasePin *CVideoRenderer::GetPin (int n) {
 HRESULT CVideoRenderer::DoRenderSample (IMediaSample *pMediaSample) {
 
 	CheckPointer(pMediaSample, E_POINTER);
-	CAutoLock cInterfaceLock(&m_InterfaceLock);
 
 	if (g_pNDI_send) {
+
+		CAutoLock cInterfaceLock(&m_InterfaceLock);
 
 		PBYTE pbData;
 		HRESULT hr = pMediaSample->GetPointer(&pbData);
 		if (FAILED(hr)) return hr;
 
 		//send the frame via NDI
-		NDIlib_video_frame_v2_t NDI_video_frame;
+#ifdef ASYNC_MODE
+		memcpy(g_data, pbData, pMediaSample->GetActualDataLength());
+		g_NDI_video_frame.p_data = g_data;
+		NDIlib_send_send_video_async_v2(g_pNDI_send, &g_NDI_video_frame);
+#else
+		g_NDI_video_frame.p_data = pbData;
+		NDIlib_send_send_video_v2(g_pNDI_send, &g_NDI_video_frame);
+#endif
 
-		NDI_video_frame.xres = g_videoSize.cx;
-		NDI_video_frame.yres = g_videoSize.cy;
-		NDI_video_frame.FourCC = g_videoFourCC;
-		NDI_video_frame.p_data = pbData;
-
-		NDIlib_send_send_video_v2(g_pNDI_send, &NDI_video_frame);
 	}
 
 	return S_OK;
@@ -230,11 +251,11 @@ HRESULT CVideoRenderer::SetMediaType (const CMediaType *pMediaType) {
 	m_mtIn = *pMediaType;
 
 	const GUID *pSubType = pMediaType->Subtype();
-	if      (*pSubType == MEDIASUBTYPE_UYVY)   g_videoFourCC = NDIlib_FourCC_type_UYVY;
-	else if (*pSubType == MEDIASUBTYPE_NV12)   g_videoFourCC = NDIlib_FourCC_type_NV12;
-	else if (*pSubType == MEDIASUBTYPE_RGB32)  g_videoFourCC = NDIlib_FourCC_type_BGRX; // vertically flipped
-	else if (*pSubType == MEDIASUBTYPE_ARGB32) g_videoFourCC = NDIlib_FourCC_type_BGRA; // vertically flipped
-	//else if (*pSubType == MEDIASUBTYPE_YV12)  g_videoFourCC = NDIlib_FourCC_type_YV12; // not working
+	if      (*pSubType == MEDIASUBTYPE_UYVY)   g_NDI_video_frame.FourCC = NDIlib_FourCC_type_UYVY;
+	else if (*pSubType == MEDIASUBTYPE_NV12)   g_NDI_video_frame.FourCC = NDIlib_FourCC_type_NV12;
+	else if (*pSubType == MEDIASUBTYPE_RGB32)  g_NDI_video_frame.FourCC = NDIlib_FourCC_type_BGRX; // vertically flipped
+	else if (*pSubType == MEDIASUBTYPE_ARGB32) g_NDI_video_frame.FourCC = NDIlib_FourCC_type_BGRA; // vertically flipped
+	//else if (*pSubType == MEDIASUBTYPE_YV12)  g_NDI_video_frame.FourCC = NDIlib_FourCC_type_YV12; // not working
 
 	else {
 		NOTE("Invalid video media subtype");
@@ -286,9 +307,21 @@ HRESULT CVideoRenderer::CompleteConnect (IPin *pReceivePin) {
 	// Has the video size changed between connections?
 	if ((m_mtIn.formattype == FORMAT_VideoInfo) && (m_mtIn.cbFormat == sizeof(VIDEOINFOHEADER) && (m_mtIn.pbFormat != NULL))) {
 		VIDEOINFOHEADER *pVideoInfo = (VIDEOINFOHEADER *)m_mtIn.Format();
-		g_videoSize.cx = pVideoInfo->bmiHeader.biWidth;
-		g_videoSize.cy = pVideoInfo->bmiHeader.biHeight;
-		if (g_videoSize.cy < 0) g_videoSize.cy = -g_videoSize.cy; // do we need this?
+
+		g_NDI_video_frame.xres = pVideoInfo->bmiHeader.biWidth;
+		g_NDI_video_frame.yres = pVideoInfo->bmiHeader.biHeight;
+		if (g_NDI_video_frame.yres < 0) g_NDI_video_frame.yres = -g_NDI_video_frame.yres; // do we need this?
+
+#ifdef ASYNC_MODE
+		if (g_data) {
+			g_data = (PBYTE)realloc(g_data, g_NDI_video_frame.xres * g_NDI_video_frame.yres * pVideoInfo->bmiHeader.biBitCount / 8);
+		}
+		else {
+			g_data = (PBYTE)malloc(g_NDI_video_frame.xres * g_NDI_video_frame.yres * pVideoInfo->bmiHeader.biBitCount / 8);
+		}
+		if (!g_data) return E_OUTOFMEMORY;
+#endif
+
 		return NOERROR;
 	}
 
